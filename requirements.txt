@@ -3,3 +3,4 @@ flask-cors
 PyJWT
 werkzeug
 gunicorn
+psycopg2-binary
