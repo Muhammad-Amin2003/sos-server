@@ -4,8 +4,9 @@ from datetime import datetime, timedelta
 from werkzeug.security import generate_password_hash, check_password_hash
 import jwt
 import logging
-import sqlite3
 import os
+import psycopg2
+from psycopg2.extras import RealDictCursor
 
 app = Flask(__name__)
 CORS(app)
@@ -13,27 +14,24 @@ logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
 SECRET_KEY = 'sos20_secret_key'
-DB_PATH = '/tmp/sos20.db'
 
 def get_db():
-    conn = sqlite3.connect(DB_PATH)
-    conn.row_factory = sqlite3.Row
-    return conn
+    return psycopg2.connect(os.environ['DATABASE_URL'], sslmode='require')
 
 def init_db():
     conn = get_db()
-    conn.execute('''CREATE TABLE IF NOT EXISTS users (
-        id INTEGER PRIMARY KEY AUTOINCREMENT,
-        name TEXT, email TEXT UNIQUE, password TEXT,
-        role TEXT, phone TEXT, blood_type TEXT,
+    cur = conn.cursor()
+    cur.execute('''CREATE TABLE IF NOT EXISTS users (
+        id SERIAL PRIMARY KEY, name TEXT, email TEXT UNIQUE,
+        password TEXT, role TEXT, phone TEXT, blood_type TEXT,
         allergies TEXT, medications TEXT, created_at TEXT)''')
-    conn.execute('''CREATE TABLE IF NOT EXISTS alerts (
-        id INTEGER PRIMARY KEY AUTOINCREMENT,
-        timestamp TEXT, name TEXT, phone TEXT,
+    cur.execute('''CREATE TABLE IF NOT EXISTS alerts (
+        id SERIAL PRIMARY KEY, timestamp TEXT, name TEXT, phone TEXT,
         blood_type TEXT, allergies TEXT, medications TEXT,
         latitude REAL, longitude REAL, accuracy REAL,
         device_name TEXT, os_version TEXT, status TEXT)''')
     conn.commit()
+    cur.close()
     conn.close()
 
 init_db()
@@ -57,7 +55,10 @@ def get_current_user():
     if not payload:
         return None
     conn = get_db()
-    user = conn.execute('SELECT * FROM users WHERE id=?', (payload['user_id'],)).fetchone()
+    cur = conn.cursor(cursor_factory=RealDictCursor)
+    cur.execute('SELECT * FROM users WHERE id=%s', (payload['user_id'],))
+    user = cur.fetchone()
+    cur.close()
     conn.close()
     return dict(user) if user else None
 
@@ -78,16 +79,16 @@ def register():
             return jsonify({'status':'error','message':'Заполните все поля'}), 400
 
         conn = get_db()
-        existing = conn.execute('SELECT id FROM users WHERE email=?', (email,)).fetchone()
-        if existing:
-            conn.close()
+        cur = conn.cursor(cursor_factory=RealDictCursor)
+        cur.execute('SELECT id FROM users WHERE email=%s', (email,))
+        if cur.fetchone():
+            cur.close(); conn.close()
             return jsonify({'status':'error','message':'Email уже зарегистрирован'}), 409
 
-        conn.execute('INSERT INTO users (name,email,password,role,phone,blood_type,allergies,medications,created_at) VALUES (?,?,?,?,?,?,?,?,?)',
+        cur.execute('INSERT INTO users (name,email,password,role,phone,blood_type,allergies,medications,created_at) VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s) RETURNING *',
             (name, email, generate_password_hash(password), role, phone, blood_type, allergies, medications, datetime.now().isoformat()))
-        conn.commit()
-        user = conn.execute('SELECT * FROM users WHERE email=?', (email,)).fetchone()
-        conn.close()
+        user = dict(cur.fetchone())
+        conn.commit(); cur.close(); conn.close()
 
         token = generate_token(user['id'], user['role'])
         logger.info(f"✅ Новый пользователь: {name} ({email}) роль={role}")
@@ -105,12 +106,15 @@ def login():
         password = data.get('password','')
 
         conn = get_db()
-        user = conn.execute('SELECT * FROM users WHERE email=?', (email,)).fetchone()
-        conn.close()
+        cur = conn.cursor(cursor_factory=RealDictCursor)
+        cur.execute('SELECT * FROM users WHERE email=%s', (email,))
+        user = cur.fetchone()
+        cur.close(); conn.close()
 
         if not user or not check_password_hash(user['password'], password):
             return jsonify({'status':'error','message':'Неверный email или пароль'}), 401
 
+        user = dict(user)
         token = generate_token(user['id'], user['role'])
         logger.info(f"🔑 Вход: {user['name']} ({email})")
         return jsonify({'status':'success','token':token,'role':user['role'],'user_id':str(user['id']),'name':user['name']})
@@ -135,12 +139,12 @@ def update_profile():
     try:
         data = request.get_json()
         conn = get_db()
-        conn.execute('UPDATE users SET name=?,phone=?,blood_type=?,allergies=?,medications=? WHERE id=?',
+        cur = conn.cursor()
+        cur.execute('UPDATE users SET name=%s,phone=%s,blood_type=%s,allergies=%s,medications=%s WHERE id=%s',
             (data.get('name',user['name']), data.get('phone',user.get('phone','')),
              data.get('blood_type',user.get('blood_type','')), data.get('allergies',user.get('allergies','')),
              data.get('medications',user.get('medications','')), user['id']))
-        conn.commit()
-        conn.close()
+        conn.commit(); cur.close(); conn.close()
         return jsonify({'status':'success'})
     except Exception as e:
         return jsonify({'status':'error','message':str(e)}), 500
@@ -156,14 +160,14 @@ def receive_emergency_alert():
                 return jsonify({'status':'error','message':f'Отсутствует поле: {field}'}), 400
 
         conn = get_db()
-        conn.execute('INSERT INTO alerts (timestamp,name,phone,blood_type,allergies,medications,latitude,longitude,accuracy,device_name,os_version,status) VALUES (?,?,?,?,?,?,?,?,?,?,?,?)',
+        cur = conn.cursor(cursor_factory=RealDictCursor)
+        cur.execute('INSERT INTO alerts (timestamp,name,phone,blood_type,allergies,medications,latitude,longitude,accuracy,device_name,os_version,status) VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s) RETURNING id',
             (datetime.now().isoformat(), data.get('name'), data.get('phone'),
              data.get('blood_type',''), data.get('allergies',''), data.get('medications',''),
              data.get('latitude'), data.get('longitude'), data.get('accuracy'),
              data.get('device_name'), data.get('os_version'), 'received'))
-        conn.commit()
-        alert_id = conn.execute('SELECT last_insert_rowid()').fetchone()[0]
-        conn.close()
+        alert_id = cur.fetchone()['id']
+        conn.commit(); cur.close(); conn.close()
 
         logger.info(f"🚨 SOS: {data.get('name')} ({data.get('phone')})")
         return jsonify({'status':'success','message':'Сигнал получен','alert_id':alert_id,'timestamp':datetime.now().isoformat()}), 201
@@ -174,15 +178,19 @@ def receive_emergency_alert():
 @app.route('/api/emergency/list', methods=['GET'])
 def get_alerts():
     conn = get_db()
-    alerts = [dict(r) for r in conn.execute('SELECT * FROM alerts ORDER BY id DESC').fetchall()]
-    conn.close()
+    cur = conn.cursor(cursor_factory=RealDictCursor)
+    cur.execute('SELECT * FROM alerts ORDER BY id DESC')
+    alerts = [dict(r) for r in cur.fetchall()]
+    cur.close(); conn.close()
     return jsonify({'status':'success','count':len(alerts),'alerts':alerts})
 
 @app.route('/api/emergency/<int:alert_id>', methods=['GET'])
 def get_alert(alert_id):
     conn = get_db()
-    alert = conn.execute('SELECT * FROM alerts WHERE id=?', (alert_id,)).fetchone()
-    conn.close()
+    cur = conn.cursor(cursor_factory=RealDictCursor)
+    cur.execute('SELECT * FROM alerts WHERE id=%s', (alert_id,))
+    alert = cur.fetchone()
+    cur.close(); conn.close()
     if alert:
         return jsonify({'status':'success','alert':dict(alert)})
     return jsonify({'status':'error','message':'Не найден'}), 404
@@ -192,9 +200,9 @@ def update_alert_status(alert_id):
     try:
         data = request.get_json()
         conn = get_db()
-        conn.execute('UPDATE alerts SET status=? WHERE id=?', (data.get('status','received'), alert_id))
-        conn.commit()
-        conn.close()
+        cur = conn.cursor()
+        cur.execute('UPDATE alerts SET status=%s WHERE id=%s', (data.get('status','received'), alert_id))
+        conn.commit(); cur.close(); conn.close()
         return jsonify({'status':'success'})
     except Exception as e:
         return jsonify({'status':'error','message':str(e)}), 500
@@ -202,9 +210,12 @@ def update_alert_status(alert_id):
 @app.route('/api/health', methods=['GET'])
 def health_check():
     conn = get_db()
-    users = conn.execute('SELECT COUNT(*) FROM users').fetchone()[0]
-    alerts = conn.execute('SELECT COUNT(*) FROM alerts').fetchone()[0]
-    conn.close()
+    cur = conn.cursor()
+    cur.execute('SELECT COUNT(*) FROM users')
+    users = cur.fetchone()[0]
+    cur.execute('SELECT COUNT(*) FROM alerts')
+    alerts = cur.fetchone()[0]
+    cur.close(); conn.close()
     return jsonify({'status':'ok','users':users,'alerts':alerts,'timestamp':datetime.now().isoformat()})
 
 @app.errorhandler(404)
