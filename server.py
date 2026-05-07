@@ -100,13 +100,13 @@ def get_current_user():
 def register():
     try:
         data = request.get_json()
-        name       = data.get('name', '').strip()
-        email      = data.get('email', '').strip().lower()
-        password   = data.get('password', '')
-        role       = data.get('role', 'user')
-        phone      = data.get('phone', '')
-        blood_type = data.get('blood_type', '')
-        allergies  = data.get('allergies', '')
+        name        = data.get('name', '').strip()
+        email       = data.get('email', '').strip().lower()
+        password    = data.get('password', '')
+        role        = data.get('role', 'user')
+        phone       = data.get('phone', '')
+        blood_type  = data.get('blood_type', '')
+        allergies   = data.get('allergies', '')
         medications = data.get('medications', '')
 
         if not name or not email or not password:
@@ -218,7 +218,6 @@ def update_profile():
 
 @app.route('/api/worker/availability', methods=['PUT'])
 def set_availability():
-    """Сотрудник меняет свой статус: свободен / занят"""
     user = get_current_user()
     if not user or user['role'] != 'worker':
         return jsonify({'status': 'error', 'message': 'Только для сотрудников'}), 403
@@ -238,7 +237,6 @@ def set_availability():
 
 @app.route('/api/worker/availability', methods=['GET'])
 def get_my_availability():
-    """Получить свой текущий статус"""
     user = get_current_user()
     if not user:
         return jsonify({'status': 'error', 'message': 'Не авторизован'}), 401
@@ -248,18 +246,43 @@ def get_my_availability():
     })
 
 # ─────────────────────────────────────────
+# ✅ НОВЫЙ ЭНДПОИНТ: сброс всех сотрудников в is_available=TRUE
+# Используй если база "застряла" — все заняты навсегда
+# POST /api/admin/reset-workers
+# ─────────────────────────────────────────
+
+@app.route('/api/admin/reset-workers', methods=['POST'])
+def reset_all_workers():
+    """Сбрасывает всех сотрудников в статус 'свободен'. Для отладки."""
+    conn = get_db()
+    cur = conn.cursor()
+    cur.execute("UPDATE users SET is_available=TRUE WHERE role='worker'")
+    conn.commit()
+    cur.execute("SELECT COUNT(*) FROM users WHERE role='worker'")
+    count = cur.fetchone()[0]
+    cur.close(); conn.close()
+    logger.info(f"🔄 Сброс: {count} сотрудников теперь свободны")
+    return jsonify({'status': 'success', 'workers_reset': count})
+
+# ─────────────────────────────────────────
 # SOS СИГНАЛЫ
 # ─────────────────────────────────────────
 
 def assign_free_worker(alert_id, service_type):
     """
     Находит свободного сотрудника и назначает на SOS сигнал.
-    Возвращает данные сотрудника или None.
+
+    ✅ ИСПРАВЛЕНО 1: убрана фильтрация по service_type в SQL —
+       все сотрудники универсальные, назначаем любого свободного.
+
+    ✅ ИСПРАВЛЕНО 2: сотрудник НЕ помечается is_available=FALSE автоматически.
+       Теперь сотрудник сам управляет своей доступностью через
+       PUT /api/worker/availability или завершая сигнал.
+       Это решает проблему когда все сотрудники навсегда "застревали" в занятых.
     """
     conn = get_db()
     cur = conn.cursor(cursor_factory=RealDictCursor)
 
-    # Ищем свободного сотрудника (случайный из доступных)
     cur.execute('''SELECT id, name, phone FROM users
                    WHERE role='worker' AND is_available=TRUE
                    ORDER BY RANDOM() LIMIT 1''')
@@ -269,7 +292,6 @@ def assign_free_worker(alert_id, service_type):
         worker = dict(worker)
         now = datetime.now().isoformat()
 
-        # Назначаем сотрудника на сигнал
         cur.execute('''UPDATE alerts SET
                        assigned_worker_id=%s,
                        assigned_worker_name=%s,
@@ -278,9 +300,9 @@ def assign_free_worker(alert_id, service_type):
                        WHERE id=%s''',
                     (worker['id'], worker['name'], now, alert_id))
 
-        # Помечаем сотрудника как занятого
-        cur.execute('UPDATE users SET is_available=FALSE WHERE id=%s',
-                    (worker['id'],))
+        # ✅ УБРАНО: cur.execute('UPDATE users SET is_available=FALSE WHERE id=%s', ...)
+        # Сотрудник остаётся свободным — он сам меняет статус через приложение.
+        # Это предотвращает бесконечную блокировку всех сотрудников.
 
         conn.commit()
         logger.info(f"👷 Сотрудник {worker['name']} назначен на сигнал #{alert_id}")
@@ -290,6 +312,7 @@ def assign_free_worker(alert_id, service_type):
     cur.close()
     conn.close()
     return worker
+
 
 @app.route('/api/emergency', methods=['POST'])
 def receive_emergency_alert():
@@ -325,7 +348,6 @@ def receive_emergency_alert():
 
         logger.info(f"🚨 SOS #{alert_id}: {data.get('name')} ({data.get('phone')})")
 
-        # Назначаем свободного сотрудника
         worker = assign_free_worker(alert_id, data.get('service_type', ''))
 
         response_data = {
@@ -352,16 +374,12 @@ def receive_emergency_alert():
 
 @app.route('/api/emergency/list', methods=['GET'])
 def get_alerts():
-    """
-    ✅ ИСПРАВЛЕНО: возвращает массив [] вместо объекта {}
-    Андроид ожидает Call<List<SosRequest>>
-    """
     conn = get_db()
     cur = conn.cursor(cursor_factory=RealDictCursor)
     cur.execute('SELECT * FROM alerts ORDER BY id DESC')
     alerts = [dict(r) for r in cur.fetchall()]
     cur.close(); conn.close()
-    return jsonify(alerts)  # ✅ просто массив
+    return jsonify(alerts)
 
 @app.route('/api/emergency/<int:alert_id>', methods=['GET'])
 def get_alert(alert_id):
@@ -384,12 +402,10 @@ def update_alert_status(alert_id):
         conn = get_db()
         cur = conn.cursor(cursor_factory=RealDictCursor)
 
-        # Обновляем статус сигнала
         cur.execute('UPDATE alerts SET status=%s WHERE id=%s RETURNING assigned_worker_id',
                     (new_status, alert_id))
         result = cur.fetchone()
 
-        # Если сигнал завершён — освобождаем сотрудника
         if new_status == 'completed' and result and result['assigned_worker_id']:
             cur.execute('UPDATE users SET is_available=TRUE WHERE id=%s',
                         (result['assigned_worker_id'],))
