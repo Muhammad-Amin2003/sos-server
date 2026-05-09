@@ -7,21 +7,37 @@ import logging
 import os
 import psycopg2
 from psycopg2.extras import RealDictCursor
+import firebase_admin
+from firebase_admin import credentials, messaging
 
 app = Flask(__name__)
 CORS(app)
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
-SECRET_KEY = 'sos20_secret_key'
+SECRET_KEY = os.environ.get('SECRET_KEY', 'dev_fallback_change_in_production')
+
+_firebase_initialized = False
+try:
+    cred_path = os.environ.get('FIREBASE_CREDENTIALS', 'firebase-adminsdk.json')
+    if os.path.exists(cred_path):
+        cred = credentials.Certificate(cred_path)
+        firebase_admin.initialize_app(cred)
+        _firebase_initialized = True
+        logger.info("✅ Firebase Admin SDK инициализирован")
+    else:
+        logger.warning("⚠️ firebase-adminsdk.json не найден — FCM отключён")
+except Exception as e:
+    logger.error(f"❌ Ошибка инициализации Firebase: {e}")
+
 
 def get_db():
     return psycopg2.connect(os.environ['DATABASE_URL'], sslmode='require')
 
+
 def init_db():
     conn = get_db()
     cur = conn.cursor()
-
     cur.execute('''CREATE TABLE IF NOT EXISTS users (
         id SERIAL PRIMARY KEY,
         name TEXT,
@@ -33,9 +49,13 @@ def init_db():
         allergies TEXT,
         medications TEXT,
         is_available BOOLEAN DEFAULT TRUE,
+        fcm_token TEXT,
         created_at TEXT
     )''')
-
+    try:
+        cur.execute("ALTER TABLE users ADD COLUMN IF NOT EXISTS fcm_token TEXT")
+    except Exception:
+        pass
     cur.execute('''CREATE TABLE IF NOT EXISTS alerts (
         id SERIAL PRIMARY KEY,
         timestamp TEXT,
@@ -56,12 +76,13 @@ def init_db():
         assigned_worker_name TEXT,
         assigned_at TEXT
     )''')
-
     conn.commit()
     cur.close()
     conn.close()
 
+
 init_db()
+
 
 def generate_token(user_id, role):
     payload = {
@@ -71,11 +92,13 @@ def generate_token(user_id, role):
     }
     return jwt.encode(payload, SECRET_KEY, algorithm='HS256')
 
+
 def verify_token(token):
     try:
         return jwt.decode(token, SECRET_KEY, algorithms=['HS256'])
-    except:
+    except Exception:
         return None
+
 
 def get_current_user():
     auth_header = request.headers.get('Authorization', '')
@@ -92,9 +115,51 @@ def get_current_user():
     conn.close()
     return dict(user) if user else None
 
-# ─────────────────────────────────────────
-# AUTH
-# ─────────────────────────────────────────
+
+def send_fcm_to_worker(worker_id, alert_id, alert_data):
+    if not _firebase_initialized:
+        logger.warning("FCM не инициализирован — push не отправлен")
+        return False
+    conn = get_db()
+    cur = conn.cursor(cursor_factory=RealDictCursor)
+    cur.execute('SELECT fcm_token FROM users WHERE id=%s', (worker_id,))
+    row = cur.fetchone()
+    cur.close()
+    conn.close()
+    if not row or not row.get('fcm_token'):
+        logger.warning(f"⚠️ FCM-токен не найден для сотрудника #{worker_id}")
+        return False
+    try:
+        message = messaging.Message(
+            notification=messaging.Notification(
+                title=f"🚨 Новый SOS сигнал #{alert_id}",
+                body=f"{alert_data.get('name')} · {alert_data.get('service_type', 'Экстренный')}",
+            ),
+            data={
+                'alert_id': str(alert_id),
+                'name': str(alert_data.get('name', '')),
+                'phone': str(alert_data.get('phone', '')),
+                'blood_type': str(alert_data.get('blood_type', '')),
+                'latitude': str(alert_data.get('latitude', '')),
+                'longitude': str(alert_data.get('longitude', '')),
+                'service_type': str(alert_data.get('service_type', '')),
+            },
+            android=messaging.AndroidConfig(
+                priority='high',
+                notification=messaging.AndroidNotification(
+                    sound='default',
+                    channel_id='sos_alerts',
+                )
+            ),
+            token=row['fcm_token'],
+        )
+        response = messaging.send(message)
+        logger.info(f"✅ FCM отправлен сотруднику #{worker_id}: {response}")
+        return True
+    except Exception as e:
+        logger.error(f"❌ Ошибка FCM: {e}")
+        return False
+
 
 @app.route('/api/auth/register', methods=['POST'])
 def register():
@@ -108,6 +173,7 @@ def register():
         blood_type  = data.get('blood_type', '')
         allergies   = data.get('allergies', '')
         medications = data.get('medications', '')
+        fcm_token   = data.get('fcm_token', '')
 
         if not name or not email or not password:
             return jsonify({'status': 'error', 'message': 'Заполните все поля'}), 400
@@ -120,10 +186,12 @@ def register():
             return jsonify({'status': 'error', 'message': 'Email уже зарегистрирован'}), 409
 
         cur.execute('''INSERT INTO users
-            (name, email, password, role, phone, blood_type, allergies, medications, is_available, created_at)
-            VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s) RETURNING *''',
+            (name, email, password, role, phone, blood_type, allergies,
+             medications, is_available, fcm_token, created_at)
+            VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s) RETURNING *''',
             (name, email, generate_password_hash(password), role, phone,
-             blood_type, allergies, medications, True, datetime.now().isoformat()))
+             blood_type, allergies, medications, True,
+             fcm_token, datetime.now().isoformat()))
         user = dict(cur.fetchone())
         conn.commit(); cur.close(); conn.close()
 
@@ -136,28 +204,35 @@ def register():
             'user_id': str(user['id']),
             'name': user['name']
         }), 201
-
     except Exception as e:
         logger.error(f"❌ Ошибка регистрации: {str(e)}")
         return jsonify({'status': 'error', 'message': str(e)}), 500
 
+
 @app.route('/api/auth/login', methods=['POST'])
 def login():
     try:
-        data     = request.get_json()
-        email    = data.get('email', '').strip().lower()
-        password = data.get('password', '')
+        data      = request.get_json()
+        email     = data.get('email', '').strip().lower()
+        password  = data.get('password', '')
+        fcm_token = data.get('fcm_token', '')
 
         conn = get_db()
         cur = conn.cursor(cursor_factory=RealDictCursor)
         cur.execute('SELECT * FROM users WHERE email=%s', (email,))
         user = cur.fetchone()
-        cur.close(); conn.close()
 
         if not user or not check_password_hash(user['password'], password):
+            cur.close(); conn.close()
             return jsonify({'status': 'error', 'message': 'Неверный email или пароль'}), 401
 
         user = dict(user)
+        if fcm_token:
+            cur.execute('UPDATE users SET fcm_token=%s WHERE id=%s',
+                        (fcm_token, user['id']))
+            conn.commit()
+        cur.close(); conn.close()
+
         token = generate_token(user['id'], user['role'])
         logger.info(f"🔑 Вход: {user['name']} ({email})")
         return jsonify({
@@ -167,9 +242,9 @@ def login():
             'user_id': str(user['id']),
             'name': user['name']
         })
-
     except Exception as e:
         return jsonify({'status': 'error', 'message': str(e)}), 500
+
 
 @app.route('/api/auth/profile', methods=['GET'])
 def get_profile():
@@ -188,6 +263,7 @@ def get_profile():
         'role': user['role'],
         'is_available': user.get('is_available', True)
     })
+
 
 @app.route('/api/auth/profile', methods=['PUT'])
 def update_profile():
@@ -212,9 +288,22 @@ def update_profile():
     except Exception as e:
         return jsonify({'status': 'error', 'message': str(e)}), 500
 
-# ─────────────────────────────────────────
-# СОТРУДНИКИ — статус доступности
-# ─────────────────────────────────────────
+
+@app.route('/api/auth/fcm-token', methods=['PUT'])
+def update_fcm_token():
+    user = get_current_user()
+    if not user:
+        return jsonify({'status': 'error', 'message': 'Не авторизован'}), 401
+    data = request.get_json()
+    fcm_token = data.get('fcm_token', '').strip()
+    if not fcm_token:
+        return jsonify({'status': 'error', 'message': 'fcm_token обязателен'}), 400
+    conn = get_db()
+    cur = conn.cursor()
+    cur.execute('UPDATE users SET fcm_token=%s WHERE id=%s', (fcm_token, user['id']))
+    conn.commit(); cur.close(); conn.close()
+    return jsonify({'status': 'success'})
+
 
 @app.route('/api/worker/availability', methods=['PUT'])
 def set_availability():
@@ -229,31 +318,21 @@ def set_availability():
         cur.execute('UPDATE users SET is_available=%s WHERE id=%s',
                     (is_available, user['id']))
         conn.commit(); cur.close(); conn.close()
-        status_text = "свободен" if is_available else "занят"
-        logger.info(f"👷 {user['name']} теперь {status_text}")
         return jsonify({'status': 'success', 'is_available': is_available})
     except Exception as e:
         return jsonify({'status': 'error', 'message': str(e)}), 500
+
 
 @app.route('/api/worker/availability', methods=['GET'])
 def get_my_availability():
     user = get_current_user()
     if not user:
         return jsonify({'status': 'error', 'message': 'Не авторизован'}), 401
-    return jsonify({
-        'status': 'success',
-        'is_available': user.get('is_available', True)
-    })
+    return jsonify({'status': 'success', 'is_available': user.get('is_available', True)})
 
-# ─────────────────────────────────────────
-# ✅ НОВЫЙ ЭНДПОИНТ: сброс всех сотрудников в is_available=TRUE
-# Используй если база "застряла" — все заняты навсегда
-# POST /api/admin/reset-workers
-# ─────────────────────────────────────────
 
 @app.route('/api/admin/reset-workers', methods=['POST'])
 def reset_all_workers():
-    """Сбрасывает всех сотрудников в статус 'свободен'. Для отладки."""
     conn = get_db()
     cur = conn.cursor()
     cur.execute("UPDATE users SET is_available=TRUE WHERE role='worker'")
@@ -261,37 +340,19 @@ def reset_all_workers():
     cur.execute("SELECT COUNT(*) FROM users WHERE role='worker'")
     count = cur.fetchone()[0]
     cur.close(); conn.close()
-    logger.info(f"🔄 Сброс: {count} сотрудников теперь свободны")
     return jsonify({'status': 'success', 'workers_reset': count})
 
-# ─────────────────────────────────────────
-# SOS СИГНАЛЫ
-# ─────────────────────────────────────────
 
-def assign_free_worker(alert_id, service_type):
-    """
-    Находит свободного сотрудника и назначает на SOS сигнал.
-
-    ✅ ИСПРАВЛЕНО 1: убрана фильтрация по service_type в SQL —
-       все сотрудники универсальные, назначаем любого свободного.
-
-    ✅ ИСПРАВЛЕНО 2: сотрудник НЕ помечается is_available=FALSE автоматически.
-       Теперь сотрудник сам управляет своей доступностью через
-       PUT /api/worker/availability или завершая сигнал.
-       Это решает проблему когда все сотрудники навсегда "застревали" в занятых.
-    """
+def assign_free_worker(alert_id, service_type, alert_data):
     conn = get_db()
     cur = conn.cursor(cursor_factory=RealDictCursor)
-
     cur.execute('''SELECT id, name, phone FROM users
                    WHERE role='worker' AND is_available=TRUE
                    ORDER BY RANDOM() LIMIT 1''')
     worker = cur.fetchone()
-
     if worker:
         worker = dict(worker)
         now = datetime.now().isoformat()
-
         cur.execute('''UPDATE alerts SET
                        assigned_worker_id=%s,
                        assigned_worker_name=%s,
@@ -299,16 +360,8 @@ def assign_free_worker(alert_id, service_type):
                        status='assigned'
                        WHERE id=%s''',
                     (worker['id'], worker['name'], now, alert_id))
-
-        # ✅ УБРАНО: cur.execute('UPDATE users SET is_available=FALSE WHERE id=%s', ...)
-        # Сотрудник остаётся свободным — он сам меняет статус через приложение.
-        # Это предотвращает бесконечную блокировку всех сотрудников.
-
         conn.commit()
-        logger.info(f"👷 Сотрудник {worker['name']} назначен на сигнал #{alert_id}")
-    else:
-        logger.warning(f"⚠️ Нет свободных сотрудников для сигнала #{alert_id}")
-
+        send_fcm_to_worker(worker['id'], alert_id, alert_data)
     cur.close()
     conn.close()
     return worker
@@ -320,11 +373,9 @@ def receive_emergency_alert():
         data = request.get_json()
         if not data:
             return jsonify({'status': 'error', 'message': 'Пустой JSON'}), 400
-
         for field in ['name', 'phone', 'latitude', 'longitude']:
             if field not in data:
-                return jsonify({'status': 'error',
-                                'message': f'Отсутствует поле: {field}'}), 400
+                return jsonify({'status': 'error', 'message': f'Отсутствует поле: {field}'}), 400
 
         conn = get_db()
         cur = conn.cursor(cursor_factory=RealDictCursor)
@@ -342,38 +393,31 @@ def receive_emergency_alert():
              data.get('accuracy'), data.get('device_name'),
              data.get('os_version'), data.get('service_type', ''),
              data.get('service_number', ''), 'received'))
-
         alert_id = cur.fetchone()['id']
         conn.commit(); cur.close(); conn.close()
 
-        logger.info(f"🚨 SOS #{alert_id}: {data.get('name')} ({data.get('phone')})")
-
-        worker = assign_free_worker(alert_id, data.get('service_type', ''))
-
+        worker = assign_free_worker(alert_id, data.get('service_type', ''), data)
         response_data = {
             'status': 'success',
-            'message': 'Сигнал получен',
             'alert_id': alert_id,
             'timestamp': datetime.now().isoformat()
         }
-
         if worker:
-            response_data['assigned_worker'] = {
-                'name': worker['name'],
-                'phone': worker['phone']
-            }
-            response_data['message'] = f"Сигнал получен. Назначен сотрудник: {worker['name']}"
+            response_data['assigned_worker'] = {'name': worker['name'], 'phone': worker['phone']}
+            response_data['message'] = f"Сигнал получен. Назначен: {worker['name']}"
         else:
             response_data['message'] = 'Сигнал получен. Свободных сотрудников нет.'
-
         return jsonify(response_data), 201
-
     except Exception as e:
         logger.error(f"❌ Ошибка SOS: {str(e)}")
         return jsonify({'status': 'error', 'message': str(e)}), 500
 
+
 @app.route('/api/emergency/list', methods=['GET'])
 def get_alerts():
+    user = get_current_user()
+    if not user or user['role'] not in ('worker', 'admin'):
+        return jsonify({'status': 'error', 'message': 'Нет доступа'}), 403
     conn = get_db()
     cur = conn.cursor(cursor_factory=RealDictCursor)
     cur.execute('SELECT * FROM alerts ORDER BY id DESC')
@@ -381,8 +425,29 @@ def get_alerts():
     cur.close(); conn.close()
     return jsonify(alerts)
 
+
+@app.route('/api/emergency/my', methods=['GET'])
+def get_my_alerts():
+    user = get_current_user()
+    if not user:
+        return jsonify({'status': 'error', 'message': 'Не авторизован'}), 401
+    conn = get_db()
+    cur = conn.cursor(cursor_factory=RealDictCursor)
+    cur.execute('''SELECT id, timestamp, service_type, service_number,
+                          status, assigned_worker_name, latitude, longitude
+                   FROM alerts WHERE phone=%s
+                   ORDER BY id DESC LIMIT 50''',
+                (user.get('phone'),))
+    alerts = [dict(r) for r in cur.fetchall()]
+    cur.close(); conn.close()
+    return jsonify({'status': 'success', 'alerts': alerts})
+
+
 @app.route('/api/emergency/<int:alert_id>', methods=['GET'])
 def get_alert(alert_id):
+    user = get_current_user()
+    if not user:
+        return jsonify({'status': 'error', 'message': 'Не авторизован'}), 401
     conn = get_db()
     cur = conn.cursor(cursor_factory=RealDictCursor)
     cur.execute('SELECT * FROM alerts WHERE id=%s', (alert_id,))
@@ -392,33 +457,28 @@ def get_alert(alert_id):
         return jsonify({'status': 'success', 'alert': dict(alert)})
     return jsonify({'status': 'error', 'message': 'Не найден'}), 404
 
+
 @app.route('/api/emergency/<int:alert_id>/status', methods=['PUT'])
 def update_alert_status(alert_id):
-    """Сотрудник завершает сигнал — становится снова свободным"""
+    user = get_current_user()
+    if not user or user['role'] != 'worker':
+        return jsonify({'status': 'error', 'message': 'Только для сотрудников'}), 403
     try:
         data = request.get_json()
         new_status = data.get('status', 'received')
-
         conn = get_db()
         cur = conn.cursor(cursor_factory=RealDictCursor)
-
         cur.execute('UPDATE alerts SET status=%s WHERE id=%s RETURNING assigned_worker_id',
                     (new_status, alert_id))
         result = cur.fetchone()
-
         if new_status == 'completed' and result and result['assigned_worker_id']:
             cur.execute('UPDATE users SET is_available=TRUE WHERE id=%s',
                         (result['assigned_worker_id'],))
-            logger.info(f"✅ Сотрудник #{result['assigned_worker_id']} снова свободен")
-
         conn.commit(); cur.close(); conn.close()
         return jsonify({'status': 'success'})
     except Exception as e:
         return jsonify({'status': 'error', 'message': str(e)}), 500
 
-# ─────────────────────────────────────────
-# ЗДОРОВЬЕ СЕРВЕРА
-# ─────────────────────────────────────────
 
 @app.route('/api/health', methods=['GET'])
 def health_check():
@@ -436,12 +496,15 @@ def health_check():
         'users': users,
         'alerts': alerts,
         'free_workers': free_workers,
+        'firebase_enabled': _firebase_initialized,
         'timestamp': datetime.now().isoformat()
     })
+
 
 @app.errorhandler(404)
 def not_found(e):
     return jsonify({'status': 'error', 'message': 'Не найден'}), 404
+
 
 if __name__ == '__main__':
     app.run(host='0.0.0.0', port=8080, debug=True)
