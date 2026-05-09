@@ -3,5 +3,6 @@ flask-cors
 PyJWT
 werkzeug
 gunicorn
+firebase-admin
 psycopg2-binary
 requests
