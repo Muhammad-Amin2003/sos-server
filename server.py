@@ -17,8 +17,6 @@ logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
 SECRET_KEY = os.environ.get('SECRET_KEY', 'dev_fallback_change_in_production')
-
-# Пароль для входа в админ-панель
 ADMIN_PASSWORD = os.environ.get('ADMIN_PASSWORD', 'sos_admin_2024')
 
 _firebase_initialized = False
@@ -224,7 +222,6 @@ ADMIN_HTML = '''
 <body>
 
 {% if not logged_in %}
-<!-- СТРАНИЦА ВХОДА -->
 <div class="login-box">
   <h1>🚨 SOS Admin</h1>
   {% if error %}<div class="alert">{{ error }}</div>{% endif %}
@@ -235,15 +232,12 @@ ADMIN_HTML = '''
 </div>
 
 {% else %}
-<!-- ПАНЕЛЬ УПРАВЛЕНИЯ -->
 <div class="header">
   <h1>🚨 SOS Admin Panel</h1>
   <a href="/admin/logout">Выйти</a>
 </div>
 
 <div class="container">
-
-  <!-- Статистика -->
   <div class="stats">
     <div class="stat-card">
       <div class="num">{{ stats.total_users }}</div>
@@ -259,7 +253,6 @@ ADMIN_HTML = '''
     </div>
   </div>
 
-  <!-- Создать сотрудника -->
   <div class="section">
     <h2>➕ Создать аккаунт сотрудника</h2>
     {% if create_error %}<div class="alert">{{ create_error }}</div>{% endif %}
@@ -273,25 +266,18 @@ ADMIN_HTML = '''
         <input type="email" name="email" placeholder="Email" required>
         <input type="password" name="password" placeholder="Пароль (мин. 6 символов)" required>
       </div>
-      <input type="text" name="position" placeholder="Должность (например: Врач скорой помощи)">
+      <input type="text" name="position" placeholder="Должность">
       <button class="btn btn-primary" type="submit">Создать сотрудника</button>
     </form>
   </div>
 
-  <!-- Список пользователей -->
   <div class="section">
     <h2>👥 Все пользователи</h2>
     <table>
       <thead>
         <tr>
-          <th>#</th>
-          <th>Имя</th>
-          <th>Email</th>
-          <th>Телефон</th>
-          <th>Роль</th>
-          <th>Доступен</th>
-          <th>Дата</th>
-          <th>Действия</th>
+          <th>#</th><th>Имя</th><th>Email</th><th>Телефон</th>
+          <th>Роль</th><th>Доступен</th><th>Дата</th><th>Действия</th>
         </tr>
       </thead>
       <tbody>
@@ -344,19 +330,13 @@ ADMIN_HTML = '''
     </table>
   </div>
 
-  <!-- Последние SOS сигналы -->
   <div class="section">
     <h2>🚨 Последние SOS сигналы</h2>
     <table>
       <thead>
         <tr>
-          <th>#</th>
-          <th>Имя</th>
-          <th>Телефон</th>
-          <th>Служба</th>
-          <th>Статус</th>
-          <th>Сотрудник</th>
-          <th>Время</th>
+          <th>#</th><th>Имя</th><th>Телефон</th><th>Служба</th>
+          <th>Статус</th><th>Сотрудник</th><th>Время</th>
         </tr>
       </thead>
       <tbody>
@@ -379,7 +359,6 @@ ADMIN_HTML = '''
       </tbody>
     </table>
   </div>
-
 </div>
 {% endif %}
 </body>
@@ -396,25 +375,19 @@ def admin_panel():
     logged_in = session.get('admin_logged_in', False)
     if not logged_in:
         return render_template_string(ADMIN_HTML, logged_in=False, error=None)
-
     conn = get_db()
     cur = conn.cursor(cursor_factory=RealDictCursor)
-
     cur.execute('SELECT * FROM users ORDER BY id DESC')
     users = [dict(r) for r in cur.fetchall()]
-
     cur.execute('SELECT * FROM alerts ORDER BY id DESC LIMIT 20')
     alerts = [dict(r) for r in cur.fetchall()]
-
     cur.execute('SELECT COUNT(*) FROM users')
     total_users = cur.fetchone()['count']
     cur.execute("SELECT COUNT(*) FROM users WHERE role='worker'")
     workers = cur.fetchone()['count']
     cur.execute("SELECT COUNT(*) FROM users WHERE role='worker' AND is_available=TRUE")
     free_workers = cur.fetchone()['count']
-
     cur.close(); conn.close()
-
     stats = {'total_users': total_users, 'workers': workers, 'free_workers': free_workers}
     return render_template_string(ADMIN_HTML, logged_in=True, users=users,
                                   alerts=alerts, stats=stats,
@@ -427,8 +400,7 @@ def admin_login():
     if password == ADMIN_PASSWORD:
         session['admin_logged_in'] = True
         return redirect('/admin')
-    return render_template_string(ADMIN_HTML, logged_in=False,
-                                  error='Неверный пароль')
+    return render_template_string(ADMIN_HTML, logged_in=False, error='Неверный пароль')
 
 
 @app.route('/admin/logout')
@@ -449,7 +421,6 @@ def admin_set_role():
     cur = conn.cursor()
     cur.execute('UPDATE users SET role=%s WHERE id=%s', (role, user_id))
     conn.commit(); cur.close(); conn.close()
-    logger.info(f"✅ Роль пользователя #{user_id} изменена на {role}")
     return redirect('/admin')
 
 
@@ -462,9 +433,8 @@ def admin_create_worker():
     phone    = request.form.get('phone', '').strip()
     email    = request.form.get('email', '').strip().lower()
     password = request.form.get('password', '')
-    position = request.form.get('position', '').strip()
 
-    def show_error(msg):
+    def reload_page(error=None, success=None):
         conn = get_db()
         cur = conn.cursor(cursor_factory=RealDictCursor)
         cur.execute('SELECT * FROM users ORDER BY id DESC')
@@ -478,12 +448,12 @@ def admin_create_worker():
         stats = {'total_users': total, 'workers': w, 'free_workers': fw}
         return render_template_string(ADMIN_HTML, logged_in=True, users=users,
                                       alerts=alerts, stats=stats,
-                                      create_error=msg, create_success=None)
+                                      create_error=error, create_success=success)
 
     if not name or not phone or not email or not password:
-        return show_error('Заполните все обязательные поля')
+        return reload_page(error='Заполните все обязательные поля')
     if len(password) < 6:
-        return show_error('Пароль должен быть не менее 6 символов')
+        return reload_page(error='Пароль должен быть не менее 6 символов')
 
     try:
         conn = get_db()
@@ -491,8 +461,7 @@ def admin_create_worker():
         cur.execute('SELECT id FROM users WHERE email=%s', (email,))
         if cur.fetchone():
             cur.close(); conn.close()
-            return show_error('Пользователь с таким email уже существует')
-
+            return reload_page(error='Пользователь с таким email уже существует')
         cur.execute('''INSERT INTO users
             (name, email, password, role, phone, blood_type,
              allergies, medications, is_available, created_at)
@@ -500,26 +469,9 @@ def admin_create_worker():
             (name, email, generate_password_hash(password),
              phone, datetime.now().isoformat()))
         conn.commit(); cur.close(); conn.close()
-        logger.info(f"✅ Создан сотрудник: {name} ({email})")
-
-        # Показываем успех
-        conn = get_db()
-        cur = conn.cursor(cursor_factory=RealDictCursor)
-        cur.execute('SELECT * FROM users ORDER BY id DESC')
-        users = [dict(r) for r in cur.fetchall()]
-        cur.execute('SELECT * FROM alerts ORDER BY id DESC LIMIT 20')
-        alerts = [dict(r) for r in cur.fetchall()]
-        cur.execute('SELECT COUNT(*) FROM users'); total = cur.fetchone()['count']
-        cur.execute("SELECT COUNT(*) FROM users WHERE role='worker'"); w = cur.fetchone()['count']
-        cur.execute("SELECT COUNT(*) FROM users WHERE role='worker' AND is_available=TRUE"); fw = cur.fetchone()['count']
-        cur.close(); conn.close()
-        stats = {'total_users': total, 'workers': w, 'free_workers': fw}
-        return render_template_string(ADMIN_HTML, logged_in=True, users=users,
-                                      alerts=alerts, stats=stats,
-                                      create_error=None,
-                                      create_success=f'✅ Сотрудник {name} создан! Email: {email}')
+        return reload_page(success=f'✅ Сотрудник {name} создан! Email: {email}')
     except Exception as e:
-        return show_error(f'Ошибка: {str(e)}')
+        return reload_page(error=f'Ошибка: {str(e)}')
 
 
 @app.route('/admin/delete-user', methods=['POST'])
@@ -529,89 +481,23 @@ def admin_delete_user():
     user_id = request.form.get('user_id')
     conn = get_db()
     cur = conn.cursor()
-    # Сначала убираем ссылки в alerts
     cur.execute('UPDATE alerts SET assigned_worker_id=NULL WHERE assigned_worker_id=%s', (user_id,))
     cur.execute('DELETE FROM users WHERE id=%s', (user_id,))
     conn.commit(); cur.close(); conn.close()
-    logger.info(f"🗑 Пользователь #{user_id} удалён")
     return redirect('/admin')
 
 
 # ============================================================
-# EXISTING API ROUTES (unchanged)
+# AUTH API
 # ============================================================
-
-@app.route('/api/auth/phone', methods=['POST'])
-def phone_auth():
-    """
-    Telegram-style phone auth.
-    Принимает номер телефона + firebase_uid (уже верифицированный Firebase).
-    Если пользователь существует → вход, если нет → автоматическая регистрация.
-    """
-    try:
-        data         = request.get_json()
-        phone        = data.get('phone', '').strip()
-        firebase_uid = data.get('firebase_uid', '').strip()
-
-        if not phone or not firebase_uid:
-            return jsonify({'status': 'error', 'message': 'phone и firebase_uid обязательны'}), 400
-
-        conn = get_db()
-        cur = conn.cursor(cursor_factory=RealDictCursor)
-
-        # Ищем пользователя по телефону
-        cur.execute('SELECT * FROM users WHERE phone=%s', (phone,))
-        user = cur.fetchone()
-
-        if user:
-            # Пользователь найден → вход
-            user = dict(user)
-            cur.close(); conn.close()
-            token = generate_token(user['id'], user['role'])
-            logger.info(f"🔑 Phone login: {phone} роль={user['role']}")
-            return jsonify({
-                'status': 'success',
-                'token': token,
-                'role': user['role'],
-                'user_id': str(user['id']),
-                'name': user.get('name', ''),
-                'is_new': False
-            })
-        else:
-            # Новый пользователь → автоматическая регистрация как user
-            cur.execute('''INSERT INTO users
-                (name, email, password, role, phone, blood_type,
-                 allergies, medications, is_available, created_at)
-                VALUES (%s,%s,%s,%s,%s,'','','',TRUE,%s) RETURNING *''',
-                ('', '', generate_password_hash(firebase_uid),
-                 'user', phone, datetime.now().isoformat()))
-            new_user = dict(cur.fetchone())
-            conn.commit(); cur.close(); conn.close()
-
-            token = generate_token(new_user['id'], new_user['role'])
-            logger.info(f"✅ Phone register: {phone}")
-            return jsonify({
-                'status': 'success',
-                'token': token,
-                'role': new_user['role'],
-                'user_id': str(new_user['id']),
-                'name': '',
-                'is_new': True
-            }), 201
-
-    except Exception as e:
-        logger.error(f"❌ Phone auth error: {str(e)}")
-        return jsonify({'status': 'error', 'message': str(e)}), 500
-
 
 @app.route('/api/auth/register', methods=['POST'])
 def register():
     try:
-        data = request.get_json()
+        data        = request.get_json()
         name        = data.get('name', '').strip()
         email       = data.get('email', '').strip().lower()
         password    = data.get('password', '')
-        # Роль всегда "user" — сотрудников создаёт только администратор
         role        = 'user'
         phone       = data.get('phone', '')
         blood_type  = data.get('blood_type', '')
@@ -640,7 +526,7 @@ def register():
         conn.commit(); cur.close(); conn.close()
 
         token = generate_token(user['id'], user['role'])
-        logger.info(f"✅ Новый пользователь: {name} ({email}) роль={role}")
+        logger.info(f"✅ Новый пользователь: {name} ({email})")
         return jsonify({
             'status': 'success',
             'token': token,
@@ -687,6 +573,99 @@ def login():
             'name': user['name']
         })
     except Exception as e:
+        return jsonify({'status': 'error', 'message': str(e)}), 500
+
+
+# ✅ НОВЫЙ ENDPOINT — Google Auth синхронизация
+@app.route('/api/auth/google', methods=['POST'])
+def google_auth():
+    try:
+        data  = request.get_json()
+        uid   = data.get('uid', '')
+        name  = data.get('name', '')
+        email = data.get('email', '')
+        role  = data.get('role', 'user')
+
+        if not uid or not email:
+            return jsonify({'status': 'error', 'message': 'uid и email обязательны'}), 400
+
+        conn = get_db()
+        cur = conn.cursor(cursor_factory=RealDictCursor)
+
+        # Проверяем по email
+        cur.execute('SELECT * FROM users WHERE email=%s', (email,))
+        user = cur.fetchone()
+
+        if user:
+            # Уже есть — просто возвращаем
+            user = dict(user)
+        else:
+            # Новый — создаём
+            cur.execute('''INSERT INTO users
+                (name, email, password, role, phone, blood_type,
+                 allergies, medications, is_available, created_at)
+                VALUES (%s,%s,%s,%s,'','','','',TRUE,%s) RETURNING *''',
+                (name, email, uid, role, datetime.now().isoformat()))
+            user = dict(cur.fetchone())
+            conn.commit()
+
+        cur.close(); conn.close()
+
+        token = generate_token(user['id'], user['role'])
+        logger.info(f"✅ Google Auth: {name} ({email})")
+        return jsonify({
+            'status': 'success',
+            'token': token,
+            'role': user['role'],
+            'user_id': str(user['id']),
+            'name': user['name']
+        })
+
+    except Exception as e:
+        logger.error(f"❌ Google Auth ошибка: {str(e)}")
+        return jsonify({'status': 'error', 'message': str(e)}), 500
+
+
+@app.route('/api/auth/phone', methods=['POST'])
+def phone_auth():
+    try:
+        data         = request.get_json()
+        phone        = data.get('phone', '').strip()
+        firebase_uid = data.get('firebase_uid', '').strip()
+
+        if not phone or not firebase_uid:
+            return jsonify({'status': 'error', 'message': 'phone и firebase_uid обязательны'}), 400
+
+        conn = get_db()
+        cur = conn.cursor(cursor_factory=RealDictCursor)
+        cur.execute('SELECT * FROM users WHERE phone=%s', (phone,))
+        user = cur.fetchone()
+
+        if user:
+            user = dict(user)
+            cur.close(); conn.close()
+            token = generate_token(user['id'], user['role'])
+            return jsonify({
+                'status': 'success', 'token': token, 'role': user['role'],
+                'user_id': str(user['id']), 'name': user.get('name', ''), 'is_new': False
+            })
+        else:
+            cur.execute('''INSERT INTO users
+                (name, email, password, role, phone, blood_type,
+                 allergies, medications, is_available, created_at)
+                VALUES (%s,%s,%s,%s,%s,'','','',TRUE,%s) RETURNING *''',
+                ('', '', generate_password_hash(firebase_uid),
+                 'user', phone, datetime.now().isoformat()))
+            new_user = dict(cur.fetchone())
+            conn.commit(); cur.close(); conn.close()
+            token = generate_token(new_user['id'], new_user['role'])
+            return jsonify({
+                'status': 'success', 'token': token, 'role': new_user['role'],
+                'user_id': str(new_user['id']), 'name': '', 'is_new': True
+            }), 201
+
+    except Exception as e:
+        logger.error(f"❌ Phone auth error: {str(e)}")
         return jsonify({'status': 'error', 'message': str(e)}), 500
 
 
@@ -749,6 +728,10 @@ def update_fcm_token():
     return jsonify({'status': 'success'})
 
 
+# ============================================================
+# WORKER API
+# ============================================================
+
 @app.route('/api/worker/availability', methods=['PUT'])
 def set_availability():
     user = get_current_user()
@@ -787,6 +770,10 @@ def reset_all_workers():
     return jsonify({'status': 'success', 'workers_reset': count})
 
 
+# ============================================================
+# SOS / EMERGENCY API
+# ============================================================
+
 def assign_free_worker(alert_id, service_type, alert_data):
     conn = get_db()
     cur = conn.cursor(cursor_factory=RealDictCursor)
@@ -804,10 +791,10 @@ def assign_free_worker(alert_id, service_type, alert_data):
                        status='assigned'
                        WHERE id=%s''',
                     (worker['id'], worker['name'], now, alert_id))
+        cur.execute('UPDATE users SET is_available=FALSE WHERE id=%s', (worker['id'],))
         conn.commit()
         send_fcm_to_worker(worker['id'], alert_id, alert_data)
-    cur.close()
-    conn.close()
+    cur.close(); conn.close()
     return worker
 
 
@@ -827,8 +814,7 @@ def receive_emergency_alert():
             (timestamp, name, phone, blood_type, allergies, medications,
              latitude, longitude, accuracy, device_name, os_version,
              service_type, service_number, status)
-            VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)
-            RETURNING id''',
+            VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s) RETURNING id''',
             (datetime.now().isoformat(),
              data.get('name'), data.get('phone'),
              data.get('blood_type', ''), data.get('allergies', ''),
@@ -847,11 +833,13 @@ def receive_emergency_alert():
             'timestamp': datetime.now().isoformat()
         }
         if worker:
-            response_data['assigned_worker'] = {'name': worker['name'], 'phone': worker['phone']}
+            response_data['assigned_worker'] = {
+                'name': worker['name'], 'phone': worker['phone']}
             response_data['message'] = f"Сигнал получен. Назначен: {worker['name']}"
         else:
             response_data['message'] = 'Сигнал получен. Свободных сотрудников нет.'
         return jsonify(response_data), 201
+
     except Exception as e:
         logger.error(f"❌ Ошибка SOS: {str(e)}")
         return jsonify({'status': 'error', 'message': str(e)}), 500
@@ -880,8 +868,7 @@ def get_my_alerts():
     cur.execute('''SELECT id, timestamp, service_type, service_number,
                           status, assigned_worker_name, latitude, longitude
                    FROM alerts WHERE phone=%s
-                   ORDER BY id DESC LIMIT 50''',
-                (user.get('phone'),))
+                   ORDER BY id DESC LIMIT 50''', (user.get('phone'),))
     alerts = [dict(r) for r in cur.fetchall()]
     cur.close(); conn.close()
     return jsonify({'status': 'success', 'alerts': alerts})
@@ -923,6 +910,10 @@ def update_alert_status(alert_id):
     except Exception as e:
         return jsonify({'status': 'error', 'message': str(e)}), 500
 
+
+# ============================================================
+# HEALTH CHECK
+# ============================================================
 
 @app.route('/api/health', methods=['GET'])
 def health_check():
