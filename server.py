@@ -21,14 +21,20 @@ ADMIN_PASSWORD = os.environ.get('ADMIN_PASSWORD', 'sos_admin_2024')
 
 _firebase_initialized = False
 try:
+    cred_json = os.environ.get('FIREBASE_CREDENTIALS_JSON')
     cred_path = os.environ.get('FIREBASE_CREDENTIALS', 'firebase-adminsdk.json')
-    if os.path.exists(cred_path):
+    if cred_json:
+        cred = credentials.Certificate(json.loads(cred_json))
+        firebase_admin.initialize_app(cred)
+        _firebase_initialized = True
+        logger.info("✅ Firebase Admin SDK инициализирован (из env)")
+    elif os.path.exists(cred_path):
         cred = credentials.Certificate(cred_path)
         firebase_admin.initialize_app(cred)
         _firebase_initialized = True
-        logger.info("✅ Firebase Admin SDK инициализирован")
+        logger.info("✅ Firebase Admin SDK инициализирован (из файла)")
     else:
-        logger.warning("⚠️ firebase-adminsdk.json не найден — FCM отключён")
+        logger.warning("⚠️ Firebase credentials не найдены — FCM отключён")
 except Exception as e:
     logger.error(f"❌ Ошибка инициализации Firebase: {e}")
 
