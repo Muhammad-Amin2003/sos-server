@@ -5,11 +5,12 @@ from werkzeug.security import generate_password_hash, check_password_hash
 import jwt
 import logging
 import os
+import json
 import psycopg2
 from psycopg2.extras import RealDictCursor
 import firebase_admin
 from firebase_admin import credentials, messaging
-import json
+
 
 app = Flask(__name__)
 app.secret_key = os.environ.get('SECRET_KEY', 'admin_secret_key')
